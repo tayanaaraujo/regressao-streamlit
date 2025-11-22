@@ -257,7 +257,7 @@ if page == "Treinar Modelo":
 
         try:
             csv_bytes = decompress_bytes(compressed)
-            df = pd.read_csv(io.BytesIO(csv_bytes))
+            df = pd.read_csv(io.BytesIO(csv_bytes), sep=";", decimal=",")
         except Exception as e:
             st.error(f"Erro ao descompactar/ler CSV: {e}")
             st.stop()
@@ -289,7 +289,7 @@ elif page == "Testar Modelo":
 
         try:
             csv_bytes = decompress_bytes(compressed)
-            df = pd.read_csv(io.BytesIO(csv_bytes))
+            df = pd.read_csv(io.BytesIO(csv_bytes), sep=";", decimal=",")
         except Exception as e:
             st.error(f"Erro: {e}")
             st.stop()
