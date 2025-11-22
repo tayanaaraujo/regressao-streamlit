@@ -258,6 +258,16 @@ if page == "Treinar Modelo":
         try:
             csv_bytes = decompress_bytes(compressed)
             df = pd.read_csv(io.BytesIO(csv_bytes), sep=",")
+
+            # correção de BOM / caracteres invisíveis
+            df.columns = df.columns.str.strip().str.replace('\ufeff', '', regex=False)
+
+            # tentar renomear automaticamente caso a coluna esteja com lixo
+            for c in df.columns:
+                if c.replace("\ufeff", "").strip().lower() == "time":
+                    df = df.rename(columns={c: "time"})
+                    break
+
         except Exception as e:
             st.error(f"Erro ao descompactar/ler CSV: {e}")
             st.stop()
@@ -290,6 +300,16 @@ elif page == "Testar Modelo":
         try:
             csv_bytes = decompress_bytes(compressed)
             df = pd.read_csv(io.BytesIO(csv_bytes), sep=",")
+
+            # correção de BOM / caracteres invisíveis
+            df.columns = df.columns.str.strip().str.replace('\ufeff', '', regex=False)
+
+            # tentar renomear automaticamente caso a coluna esteja com lixo
+            for c in df.columns:
+                if c.replace("\ufeff", "").strip().lower() == "time":
+                    df = df.rename(columns={c: "time"})
+                    break
+
         except Exception as e:
             st.error(f"Erro: {e}")
             st.stop()
