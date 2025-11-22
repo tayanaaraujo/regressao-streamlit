@@ -6,84 +6,145 @@ import io
 import os
 import pickle
 import base64
-import gzip
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.metrics import mean_squared_error, r2_score
 
-# tentar importar dahuffman (opcional). Usamos gzip como fallback robusto.
-try:
-    from dahuffman import HuffmanCodec
-    DAHUFFMAN_AVAILABLE = True
-except Exception:
-    DAHUFFMAN_AVAILABLE = False
+# ============================================================
+# HUFFMAN PURO  (SEM GZIP)
+# ============================================================
 
-# paths e pasta de uploads
+from heapq import heappush, heappop
+from collections import Counter
+
+
+class HuffmanNode:
+    def __init__(self, freq, symbol=None, left=None, right=None):
+        self.freq = freq
+        self.symbol = symbol  # byte (0–255) ou None
+        self.left = left
+        self.right = right
+
+    def __lt__(self, other):
+        return self.freq < other.freq
+
+
+def build_huffman_tree(freqs):
+    heap = []
+    for byte_val, f in freqs.items():
+        heappush(heap, HuffmanNode(f, symbol=byte_val))
+
+    if len(heap) == 1:
+        node = heappop(heap)
+        return HuffmanNode(node.freq, left=node)
+
+    while len(heap) > 1:
+        n1 = heappop(heap)
+        n2 = heappop(heap)
+        merged = HuffmanNode(n1.freq + n2.freq, left=n1, right=n2)
+        heappush(heap, merged)
+
+    return heappop(heap)
+
+
+def build_code_table(node, prefix="", table=None):
+    if table is None:
+        table = {}
+
+    if node.symbol is not None:
+        table[node.symbol] = prefix
+        return table
+
+    build_code_table(node.left, prefix + "0", table)
+    build_code_table(node.right, prefix + "1", table)
+    return table
+
+
+def compress_bytes(data_bytes: bytes) -> bytes:
+    freqs = Counter(data_bytes)
+    root = build_huffman_tree(freqs)
+    table = build_code_table(root)
+
+    # Codifica para uma string binária
+    bitstring = "".join(table[b] for b in data_bytes)
+
+    # Padding para múltiplo de 8 bits
+    extra_bits = 8 - (len(bitstring) % 8)
+    if extra_bits != 8:
+        bitstring += "0" * extra_bits
+    else:
+        extra_bits = 0
+
+    # Converte para bytes
+    compressed_data = bytearray()
+    for i in range(0, len(bitstring), 8):
+        byte = int(bitstring[i:i+8], 2)
+        compressed_data.append(byte)
+
+    # Criar header:
+    # 1 byte = quantidade de padding
+    # 256*4 bytes = tabela de frequências (inteiros de 32 bits)
+    header = bytes([extra_bits])
+    for i in range(256):
+        f = freqs.get(i, 0)
+        header += f.to_bytes(4, byteorder='big')  # sempre escreve 4 bytes por símbolo
+
+    return header + bytes(compressed_data)
+
+
+def decompress_bytes(encoded: bytes) -> bytes:
+    # 1) Lê padding
+    padding = encoded[0]
+
+    # 2) Lê tabela de frequências (256 inteiros de 4 bytes)
+    freqs = {}
+    pos = 1
+    for byte_val in range(256):
+        f = int.from_bytes(encoded[pos:pos+4], byteorder='big')
+        pos += 4
+        if f > 0:
+            freqs[byte_val] = f
+
+    # 3) Reconstrói árvore
+    root = build_huffman_tree(freqs)
+
+    # 4) Converte bytes compactados para string binária
+    bitstring = ""
+    for b in encoded[pos:]:
+        bitstring += f"{b:08b}"
+
+    if padding > 0:
+        bitstring = bitstring[:-padding]
+
+    # 5) Decodificação
+    output = bytearray()
+    node = root
+    for bit in bitstring:
+        node = node.left if bit == "0" else node.right
+        if node.symbol is not None:
+            output.append(node.symbol)
+            node = root
+
+    return bytes(output)
+
+
+# ============================================================
+# Persistência do modelo
+# ============================================================
+
 MODEL_PATH = "model.pkl"
 SCALER_PATH = "scaler.pkl"
 UPLOADS_DIR = "uploads"
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# --------------------------
-# compress / decompress helpers
-# --------------------------
-def compress_bytes_gzip(data_bytes: bytes) -> bytes:
-    buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode='wb') as f:
-        f.write(data_bytes)
-    return buf.getvalue()
 
-def decompress_bytes_gzip(encoded_bytes: bytes) -> bytes:
-    buf = io.BytesIO(encoded_bytes)
-    with gzip.GzipFile(fileobj=buf, mode='rb') as f:
-        return f.read()
-
-# Simple wrappers: try dahuffman for compress, but use gzip for decompress/robustness
-def compress_bytes(data_bytes: bytes) -> bytes:
-    if DAHUFFMAN_AVAILABLE:
-        try:
-            # encode bytes -> latin1 string -> huffman
-            text = data_bytes.decode('latin1')
-            codec = HuffmanCodec.from_data(text)
-            encoded = codec.encode(text)
-            if isinstance(encoded, str):
-                return encoded.encode('latin1')
-            elif isinstance(encoded, (bytes, bytearray)):
-                return bytes(encoded)
-            else:
-                return bytes(encoded)
-        except Exception:
-            return compress_bytes_gzip(data_bytes)
-    else:
-        return compress_bytes_gzip(data_bytes)
-
-def decompress_bytes(data_bytes: bytes) -> bytes:
-    # prefer gzip (robusto)
-    try:
-        return decompress_bytes_gzip(data_bytes)
-    except Exception:
-        # Se dahuffman estiver disponível, tentamos (pode falhar sem metadados)
-        if DAHUFFMAN_AVAILABLE:
-            try:
-                # tentativa: tratar como latin1 string; note que sem metadados isso pode falhar
-                encoded_text = data_bytes.decode('latin1')
-                codec = HuffmanCodec.from_data(encoded_text)  # tentativa; possivelmente incorreta
-                decoded = codec.decode(encoded_text)
-                return decoded.encode('latin1')
-            except Exception:
-                raise RuntimeError("Falha na descompressão; formato inválido.")
-        else:
-            raise RuntimeError("Falha na descompressão gzip e dahuffman não disponível.")
-
-# --------------------------
-# persistência do modelo
-# --------------------------
 def save_model_and_scaler(model, scaler):
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(model, f)
     with open(SCALER_PATH, "wb") as f:
         pickle.dump(scaler, f)
+
 
 def load_model_and_scaler():
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
@@ -94,27 +155,26 @@ def load_model_and_scaler():
         return model, scaler
     return None, None
 
+
 def reset_persistent_model():
     if os.path.exists(MODEL_PATH):
         os.remove(MODEL_PATH)
     if os.path.exists(SCALER_PATH):
         os.remove(SCALER_PATH)
-    for fname in os.listdir(UPLOADS_DIR):
+    for f in os.listdir(UPLOADS_DIR):
         try:
-            os.remove(os.path.join(UPLOADS_DIR, fname))
-        except Exception:
+            os.remove(os.path.join(UPLOADS_DIR, f))
+        except:
             pass
 
-# --------------------------
-# treino / aplicação
-# --------------------------
+
+# ============================================================
+# Treinamento e aplicação
+# ============================================================
+
 def train_model_timeseries(df, n_splits=5):
-    """
-    Treina usando TimeSeriesSplit (sem shuffle) e retorna:
-    rmse_mean, r2_mean, model, scaler
-    """
     if "time" not in df.columns:
-        raise ValueError("Coluna 'time' não encontrada no dataframe.")
+        raise ValueError("Coluna 'time' não encontrada.")
 
     y = df["time"].values
     X = df.drop(columns=["time"]).values
@@ -125,25 +185,23 @@ def train_model_timeseries(df, n_splits=5):
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
-    # R2 via cross_val_score com TimeSeriesSplit
     r2_scores = cross_val_score(model, X_scaled, y, cv=tscv, scoring='r2')
 
     rmse_scores = []
-    for train_idx, test_idx in tscv.split(X_scaled):
-        model.fit(X_scaled[train_idx], y[train_idx])
-        preds = model.predict(X_scaled[test_idx])
-        rmse_scores.append(np.sqrt(mean_squared_error(y[test_idx], preds)))
+    for tr, ts in tscv.split(X_scaled):
+        model.fit(X_scaled[tr], y[tr])
+        preds = model.predict(X_scaled[ts])
+        rmse_scores.append(np.sqrt(mean_squared_error(y[ts], preds)))
 
-    # treino final em todos os dados
     model.fit(X_scaled, y)
-    # persistir
     save_model_and_scaler(model, scaler)
 
     return np.mean(rmse_scores), np.mean(r2_scores), model, scaler
 
+
 def apply_model(df, model, scaler):
     if model is None or scaler is None:
-        raise RuntimeError("Modelo ou scaler não carregado.")
+        raise RuntimeError("Modelo não carregado.")
 
     if "time" in df.columns:
         y = df["time"].values
@@ -156,153 +214,112 @@ def apply_model(df, model, scaler):
 
     X_scaled = scaler.transform(X)
     preds = model.predict(X_scaled)
+
     results = pd.DataFrame({"predicted": preds})
 
     if has_label:
-        rmse = np.sqrt(mean_squared_error(y, preds))
-        r2 = r2_score(y, preds)
-    else:
-        rmse = None
-        r2 = None
+        return results, np.sqrt(mean_squared_error(y, preds)), r2_score(y, preds)
+    return results, None, None
 
-    return results, rmse, r2
 
-# --------------------------
-# Streamlit UI
-# --------------------------
-st.set_page_config(page_title="Regressão Linear (Timeseries)", layout="wide")
-st.title("📈 Regressão Linear (séries temporais) — MinMax + TimeSeriesSplit + Compressão ponta-a-ponta")
+# ============================================================
+# Streamlit Interface
+# ============================================================
 
-st.sidebar.header("Menu")
-page = st.sidebar.selectbox("Navegação", ["Treinar Modelo", "Testar Modelo", "Resetar Modelo", "Status"])
+st.set_page_config(page_title="Regressão Linear TS", layout="wide")
+st.title("📈 Regressão Linear — Série Temporal — Huffman Puro")
 
-# carregar modelo persistente
+page = st.sidebar.selectbox("Menu", ["Treinar Modelo", "Testar Modelo", "Resetar Modelo", "Status"])
 model, scaler = load_model_and_scaler()
-if model is not None and scaler is not None:
-    st.sidebar.success("✅ Modelo carregado do disco.")
-else:
-    st.sidebar.info("Nenhum modelo persistente encontrado. Treine um modelo.")
 
 def make_download_link_bytes(data_bytes: bytes, filename: str):
     b64 = base64.b64encode(data_bytes).decode()
-    href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">📥 Baixar {filename}</a>'
-    return href
+    return f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">📥 Baixar {filename}</a>'
 
-# --------------------------
-# Treinar
-# --------------------------
+
+# ============================================================
+# Páginas
+# ============================================================
+
 if page == "Treinar Modelo":
     st.header("📤 Upload do CSV de Treino")
-    st.write("Formato esperado: 5 colunas de lag (ex: time-5,..,time-1) + coluna 'time' (alvo).")
-    uploaded_file = st.file_uploader("Envie o CSV de treino", type=["csv"])
+    uploaded_file = st.file_uploader("Envie o CSV", type=["csv"])
 
     if uploaded_file is not None:
         raw_bytes = uploaded_file.read()
-        # salvar compactado o upload
         compressed = compress_bytes(raw_bytes)
-        saved_path = os.path.join(UPLOADS_DIR, f"train_{uploaded_file.name}.bin")
-        with open(saved_path, "wb") as f:
-            f.write(compressed)
-        st.markdown(make_download_link_bytes(compressed, f"train_{uploaded_file.name}.bin"), unsafe_allow_html=True)
-        st.success("Upload recebido e compactado (ponta-a-ponta).")
 
-        # descompactar para leitura
+        save_path = os.path.join(UPLOADS_DIR, f"train_{uploaded_file.name}.bin")
+        with open(save_path, "wb") as f:
+            f.write(compressed)
+
+        st.markdown(make_download_link_bytes(compressed, f"train_{uploaded_file.name}.bin"), unsafe_allow_html=True)
+
         try:
             csv_bytes = decompress_bytes(compressed)
-        except Exception as e:
-            st.error(f"Erro na descompressão do upload: {e}")
-            st.stop()
-
-        try:
             df = pd.read_csv(io.BytesIO(csv_bytes))
         except Exception as e:
-            st.error(f"Erro ao ler CSV: {e}")
+            st.error(f"Erro ao descompactar/ler CSV: {e}")
             st.stop()
 
-        st.write("Preview do CSV de treino:")
-        st.dataframe(df.head())
+        st.write(df.head())
 
         if "time" not in df.columns:
-            st.error("O CSV precisa conter a coluna 'time'.")
-        else:
-            if st.button("Treinar Modelo"):
-                with st.spinner("Treinando com TimeSeriesSplit (sem shuffle)..."):
-                    rmse_exp, r2_exp, trained_model, trained_scaler = train_model_timeseries(df, n_splits=5)
-                    model = trained_model
-                    scaler = trained_scaler
-                st.success("Treino concluído e modelo salvo no servidor.")
-                st.metric("RMSE (esperado - TimeSeriesSplit mean)", f"{rmse_exp:.4f}")
-                st.metric("R² (esperado - TimeSeriesSplit mean)", f"{r2_exp:.4f}")
+            st.error("CSV precisa conter coluna 'time'.")
+        elif st.button("Treinar Modelo"):
+            rmse, r2, model, scaler = train_model_timeseries(df)
+            st.success("Treinado com sucesso!")
+            st.metric("RMSE (val)", f"{rmse:.4f}")
+            st.metric("R² (val)", f"{r2:.4f}")
 
-# --------------------------
-# Testar
-# --------------------------
+
 elif page == "Testar Modelo":
     st.header("📤 Upload do CSV de Teste")
-    if model is None or scaler is None:
-        st.warning("Nenhum modelo carregado — treine ou carregue um modelo primeiro.")
 
-    uploaded_file = st.file_uploader("Envie o CSV de teste (pode conter coluna 'time' para avaliação)", type=["csv"])
+    uploaded_file = st.file_uploader("Envie o CSV", type=["csv"])
     if uploaded_file is not None:
         raw_bytes = uploaded_file.read()
         compressed = compress_bytes(raw_bytes)
-        saved_path = os.path.join(UPLOADS_DIR, f"test_{uploaded_file.name}.bin")
-        with open(saved_path, "wb") as f:
+
+        save_path = os.path.join(UPLOADS_DIR, f"test_{uploaded_file.name}.bin")
+        with open(save_path, "wb") as f:
             f.write(compressed)
+
         st.markdown(make_download_link_bytes(compressed, f"test_{uploaded_file.name}.bin"), unsafe_allow_html=True)
-        st.success("Upload de teste recebido e compactado (ponta-a-ponta).")
 
         try:
             csv_bytes = decompress_bytes(compressed)
             df = pd.read_csv(io.BytesIO(csv_bytes))
         except Exception as e:
-            st.error(f"Erro ao descompactar/ler CSV de teste: {e}")
+            st.error(f"Erro: {e}")
             st.stop()
 
-        st.write("Preview do CSV de teste:")
-        st.dataframe(df.head())
+        st.write(df.head())
 
         if st.button("Executar Teste"):
-            if model is None or scaler is None:
-                st.error("Modelo não encontrado. Treine o modelo antes de testar.")
+            if model is None:
+                st.error("Treine primeiro.")
             else:
-                results, rmse_real, r2_real = apply_model(df, model, scaler)
-                st.write("Previsões (primeiras linhas):")
-                st.dataframe(results.head())
+                result, rmse, r2 = apply_model(df, model, scaler)
+                st.dataframe(result.head())
 
-                # salvar previsões e compactar
-                out_buf = io.BytesIO()
-                results.to_csv(out_buf, index=False)
-                out_bytes = out_buf.getvalue()
-                compressed_out = compress_bytes(out_bytes)
+                out = io.BytesIO()
+                result.to_csv(out, index=False)
+                compressed_out = compress_bytes(out.getvalue())
                 st.markdown(make_download_link_bytes(compressed_out, "predicoes.bin"), unsafe_allow_html=True)
-                st.success("Previsões prontas para download (compactadas).")
 
-                if rmse_real is not None:
-                    st.metric("RMSE Real", f"{rmse_real:.4f}")
-                    st.metric("R² Real", f"{r2_real:.4f}")
-                else:
-                    st.info("Arquivo sem rótulos — apenas previsões foram geradas.")
+                if rmse is not None:
+                    st.metric("RMSE real", f"{rmse:.4f}")
+                    st.metric("R² real", f"{r2:.4f}")
 
-# --------------------------
-# Reset
-# --------------------------
+
 elif page == "Resetar Modelo":
-    st.header("🔁 Resetar modelo e arquivos persistidos")
-    if st.button("Resetar"):
+    if st.button("Resetar Tudo"):
         reset_persistent_model()
-        model = None
-        scaler = None
-        st.success("Modelo e arquivos persistidos removidos. Pronto para novo treino.")
+        st.success("Reset concluído.")
 
-# --------------------------
-# Status
-# --------------------------
+
 elif page == "Status":
-    st.header("🔍 Status do servidor")
-    st.write(f"Modelo persistido: {os.path.exists(MODEL_PATH)}")
-    st.write(f"Scaler persistido: {os.path.exists(SCALER_PATH)}")
-    st.write("Arquivos na pasta uploads:")
-    st.write(os.listdir(UPLOADS_DIR))
-    st.write(f"Dahuffman disponível: {DAHUFFMAN_AVAILABLE}")
-    st.info("Usamos gzip como método de compressão/descompressão principal por robustez.")
+    st.write("Modelo:", os.path.exists(MODEL_PATH))
+    st.write("Scaler:", os.path.exists(SCALER_PATH))
+    st.write("Uploads:", os.listdir(UPLOADS_DIR))
