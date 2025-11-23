@@ -1,345 +1,195 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io
-import os
-import pickle
-import base64
-from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, make_scorer
+from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import MinMaxScaler
+import io
+import zipfile # Para a compactação/descompactação (Requisito de Segurança)
 
-# ============================================================
-# HUFFMAN PURO  (SEM GZIP)
-# ============================================================
+# --- Configuração Inicial ---
+st.set_page_config(page_title="Projeto Regressão Linear na Nuvem", layout="wide")
+st.title("🎓 Treinamento de Modelo na Nuvem - Azure")
+TARGET_COLUMN = 'time' # Coluna alvo da série temporal
+N_LAG = 5 # Número de observações anteriores (conforme seu enunciado)
 
-from heapq import heappush, heappop
-from collections import Counter
+# --- Variáveis de Estado (Memória do App) ---
+if 'modelo' not in st.session_state:
+    st.session_state['modelo'] = None
+if 'scaler' not in st.session_state:
+    st.session_state['scaler'] = None
 
+# --- Funções de Tratamento de Dados ---
 
-class HuffmanNode:
-    def __init__(self, freq, symbol=None, left=None, right=None):
-        self.freq = freq
-        self.symbol = symbol  # byte (0–255) ou None
-        self.left = left
-        self.right = right
+@st.cache_data
+def create_lag_features(df, n_lag):
+    """Cria features de lag para dados de série temporal (t-1, t-2, ...)."""
+    df_lag = df.copy()
+    for i in range(1, n_lag + 1):
+        df_lag[f't-{i}'] = df_lag[TARGET_COLUMN].shift(i)
+    # Remove as linhas com NaN resultantes do shift (os N_LAG primeiros)
+    df_lag.dropna(inplace=True)
+    return df_lag
 
-    def __lt__(self, other):
-        return self.freq < other.freq
-
-
-def build_huffman_tree(freqs):
-    heap = []
-    for byte_val, f in freqs.items():
-        heappush(heap, HuffmanNode(f, symbol=byte_val))
-
-    if len(heap) == 1:
-        node = heappop(heap)
-        return HuffmanNode(node.freq, left=node)
-
-    while len(heap) > 1:
-        n1 = heappop(heap)
-        n2 = heappop(heap)
-        merged = HuffmanNode(n1.freq + n2.freq, left=n1, right=n2)
-        heappush(heap, merged)
-
-    return heappop(heap)
-
-
-def build_code_table(node, prefix="", table=None):
-    if table is None:
-        table = {}
-
-    if node.symbol is not None:
-        table[node.symbol] = prefix
-        return table
-
-    build_code_table(node.left, prefix + "0", table)
-    build_code_table(node.right, prefix + "1", table)
-    return table
-
-
-def compress_bytes(data_bytes: bytes) -> bytes:
-    freqs = Counter(data_bytes)
-    root = build_huffman_tree(freqs)
-    table = build_code_table(root)
-
-    # Codifica para uma string binária
-    bitstring = "".join(table[b] for b in data_bytes)
-
-    # Padding para múltiplo de 8 bits
-    extra_bits = 8 - (len(bitstring) % 8)
-    if extra_bits != 8:
-        bitstring += "0" * extra_bits
+@st.cache_data
+def load_data_zip(uploaded_file, file_type='csv'):
+    """Descompacta o arquivo ZIP e lê o CSV (Atende ao requisito Ponto-a-ponta)."""
+    if uploaded_file.name.endswith('.zip'):
+        with zipfile.ZipFile(uploaded_file, 'r') as zf:
+            # Assumimos que há um único CSV dentro do ZIP
+            csv_filename = [f for f in zf.namelist() if f.endswith('.csv')][0]
+            with zf.open(csv_filename) as csv_file:
+                return pd.read_csv(csv_file)
+    elif uploaded_file.name.endswith('.csv'):
+        # Se for CSV direto, apenas lê
+        return pd.read_csv(uploaded_file)
     else:
-        extra_bits = 0
+        st.error(f"Formato de arquivo não suportado. Use .csv ou .zip contendo um .csv.")
+        return None
 
-    # Converte para bytes
-    compressed_data = bytearray()
-    for i in range(0, len(bitstring), 8):
-        byte = int(bitstring[i:i+8], 2)
-        compressed_data.append(byte)
-
-    # Criar header:
-    # 1 byte = quantidade de padding
-    # 256*4 bytes = tabela de frequências (inteiros de 32 bits)
-    header = bytes([extra_bits])
-    for i in range(256):
-        f = freqs.get(i, 0)
-        header += f.to_bytes(4, byteorder='big')  # sempre escreve 4 bytes por símbolo
-
-    return header + bytes(compressed_data)
-
-
-def decompress_bytes(encoded: bytes) -> bytes:
-    # 1) Lê padding
-    padding = encoded[0]
-
-    # 2) Lê tabela de frequências (256 inteiros de 4 bytes)
-    freqs = {}
-    pos = 1
-    for byte_val in range(256):
-        f = int.from_bytes(encoded[pos:pos+4], byteorder='big')
-        pos += 4
-        if f > 0:
-            freqs[byte_val] = f
-
-    # 3) Reconstrói árvore
-    root = build_huffman_tree(freqs)
-
-    # 4) Converte bytes compactados para string binária
-    bitstring = ""
-    for b in encoded[pos:]:
-        bitstring += f"{b:08b}"
-
-    if padding > 0:
-        bitstring = bitstring[:-padding]
-
-    # 5) Decodificação
-    output = bytearray()
-    node = root
-    for bit in bitstring:
-        node = node.left if bit == "0" else node.right
-        if node.symbol is not None:
-            output.append(node.symbol)
-            node = root
-
-    return bytes(output)
+def compress_and_download(df, filename="resultados_previsao.zip"):
+    """Compacta o CSV de resultados em ZIP para download (Requisito de Segurança)."""
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_data = csv_buffer.getvalue()
+    
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'a', zipfile.ZIP_DEFLATED, False) as zf:
+        # Cria um arquivo CSV dentro do ZIP
+        zf.writestr('previsao.csv', csv_data)
+        
+    st.download_button(
+        label="📥 Baixar Resultados (ZIP Compactado)",
+        data=zip_buffer.getvalue(),
+        file_name=filename,
+        mime='application/zip',
+    )
 
 
-# ============================================================
-# Persistência do modelo
-# ============================================================
+# --- Barra Lateral para Reset ---
+with st.sidebar:
+    st.header("Controles")
+    if st.button("🔄 Resetar Modelo"):
+        st.session_state['modelo'] = None
+        st.session_state['scaler'] = None
+        st.info("Modelo e Normalizador resetados. Clique em Run again.")
+        st.experimental_rerun()
+    
+    st.info(f"Modelo: Regressão Linear\nLags de Série Temporal: {N_LAG}")
 
-MODEL_PATH = "model.pkl"
-SCALER_PATH = "scaler.pkl"
-UPLOADS_DIR = "uploads"
-os.makedirs(UPLOADS_DIR, exist_ok=True)
+# -------------------------------------------------------------
+# BLOCO 1: TREINAMENTO (Com Normalização e Validação Cruzada)
+# -------------------------------------------------------------
+st.header("1. Treinamento do Modelo")
+arquivo_treino = st.file_uploader("Faça upload do arquivo de Treino (.csv ou .zip)", type=['csv', 'zip'])
 
+if arquivo_treino is not None:
+    df_raw = load_data_zip(arquivo_treino)
+    if df_raw is None:
+        st.stop()
+        
+    df_treino = create_lag_features(df_raw.reset_index(drop=True), N_LAG)
+    
+    if df_treino is not None:
+        st.subheader("Amostra de Dados Processados")
+        st.dataframe(df_treino.head())
+        
+        if st.button("🚀 Treinar Modelo com Validação Cruzada"):
+            try:
+                # Separação de features e rótulos
+                X_train_clean = df_treino.drop(columns=[TARGET_COLUMN])
+                y_train = df_treino[TARGET_COLUMN]
+                
+                # Normalização Min-Max (Requisito do projeto)
+                scaler = MinMaxScaler()
+                X_train_scaled = scaler.fit_transform(X_train_clean)
+                
+                # Treino do modelo final (fit em todos os dados)
+                model = LinearRegression()
+                model.fit(X_train_scaled, y_train)
+                
+                # Validação Cruzada (Para obter EXPECTATIVA de desempenho)
+                # Usamos o MSE (Mean Squared Error) como métrica
+                mse_scorer = make_scorer(mean_squared_error, greater_is_better=False)
+                scores = cross_val_score(model, X_train_scaled, y_train, 
+                                         cv=5, # 5 Folds
+                                         scoring=mse_scorer)
+                
+                # O cross_val_score retorna valores negativos para o MSE, então pegamos a média.
+                mean_mse = -scores.mean()
+                
+                # Salvar na memória (session_state)
+                st.session_state['modelo'] = model
+                st.session_state['scaler'] = scaler
+                
+                st.success("Modelo treinado, scaler ajustado e Validação Cruzada concluída!")
+                st.subheader("Desempenho Esperado (Validação Cruzada)")
+                st.metric(label="Média do Erro Quadrático Médio (MSE)", value=f"{mean_mse:.4f}")
+                
+            except Exception as e:
+                st.error(f"Erro ao treinar: Verifique se a coluna '{TARGET_COLUMN}' existe no seu CSV. Detalhes: {e}")
 
-def save_model_and_scaler(model, scaler):
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(model, f)
-    with open(SCALER_PATH, "wb") as f:
-        pickle.dump(scaler, f)
+# -------------------------------------------------------------
+# BLOCO 2: TESTE E APLICAÇÃO (Com Verificação de Rótulos)
+# -------------------------------------------------------------
+st.header("2. Teste / Aplicação do Modelo")
 
-
-def load_model_and_scaler():
-    if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
-        with open(MODEL_PATH, "rb") as f:
-            model = pickle.load(f)
-        with open(SCALER_PATH, "rb") as f:
-            scaler = pickle.load(f)
-        return model, scaler
-    return None, None
-
-
-def reset_persistent_model():
-    if os.path.exists(MODEL_PATH):
-        os.remove(MODEL_PATH)
-    if os.path.exists(SCALER_PATH):
-        os.remove(SCALER_PATH)
-    for f in os.listdir(UPLOADS_DIR):
-        try:
-            os.remove(os.path.join(UPLOADS_DIR, f))
-        except:
-            pass
-
-
-# ============================================================
-# Treinamento e aplicação
-# ============================================================
-
-def train_model_timeseries(df, n_splits=5):
-    if "time" not in df.columns:
-        raise ValueError("Coluna 'time' não encontrada.")
-
-    y = df["time"].values
-    X = df.drop(columns=["time"]).values
-
-    scaler = MinMaxScaler()
-    X_scaled = scaler.fit_transform(X)
-    model = LinearRegression()
-
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-
-    r2_scores = cross_val_score(model, X_scaled, y, cv=tscv, scoring='r2')
-
-    rmse_scores = []
-    for tr, ts in tscv.split(X_scaled):
-        model.fit(X_scaled[tr], y[tr])
-        preds = model.predict(X_scaled[ts])
-        rmse_scores.append(np.sqrt(mean_squared_error(y[ts], preds)))
-
-    model.fit(X_scaled, y)
-    save_model_and_scaler(model, scaler)
-
-    return np.mean(rmse_scores), np.mean(r2_scores), model, scaler
-
-
-def apply_model(df, model, scaler):
-    if model is None or scaler is None:
-        raise RuntimeError("Modelo não carregado.")
-
-    if "time" in df.columns:
-        y = df["time"].values
-        X = df.drop(columns=["time"]).values
-        has_label = True
-    else:
-        X = df.values
-        y = None
-        has_label = False
-
-    X_scaled = scaler.transform(X)
-    preds = model.predict(X_scaled)
-
-    results = pd.DataFrame({"predicted": preds})
-
-    if has_label:
-        return results, np.sqrt(mean_squared_error(y, preds)), r2_score(y, preds)
-    return results, None, None
-
-
-# ============================================================
-# Streamlit Interface
-# ============================================================
-
-st.set_page_config(page_title="Regressão Linear TS", layout="wide")
-st.title("📈 Regressão Linear — Série Temporal — Huffman Puro")
-
-page = st.sidebar.selectbox("Menu", ["Treinar Modelo", "Testar Modelo", "Resetar Modelo", "Status"])
-model, scaler = load_model_and_scaler()
-
-def make_download_link_bytes(data_bytes: bytes, filename: str):
-    b64 = base64.b64encode(data_bytes).decode()
-    return f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">📥 Baixar {filename}</a>'
-
-
-# ============================================================
-# Páginas
-# ============================================================
-
-if page == "Treinar Modelo":
-    st.header("📤 Upload do CSV de Treino")
-    uploaded_file = st.file_uploader("Envie o CSV", type=["csv"])
-
-    if uploaded_file is not None:
-        raw_bytes = uploaded_file.read()
-        compressed = compress_bytes(raw_bytes)
-
-        save_path = os.path.join(UPLOADS_DIR, f"train_{uploaded_file.name}.bin")
-        with open(save_path, "wb") as f:
-            f.write(compressed)
-
-        st.markdown(make_download_link_bytes(compressed, f"train_{uploaded_file.name}.bin"), unsafe_allow_html=True)
-
-        try:
-            csv_bytes = decompress_bytes(compressed)
-            df = pd.read_csv(io.BytesIO(csv_bytes), sep=",")
-
-            # correção de BOM / caracteres invisíveis
-            df.columns = df.columns.str.strip().str.replace('\ufeff', '', regex=False)
-
-            # tentar renomear automaticamente caso a coluna esteja com lixo
-            for c in df.columns:
-                if c.replace("\ufeff", "").strip().lower() == "time":
-                    df = df.rename(columns={c: "time"})
-                    break
-
-        except Exception as e:
-            st.error(f"Erro ao descompactar/ler CSV: {e}")
+if st.session_state['modelo'] is not None:
+    arquivo_teste = st.file_uploader("Faça upload do arquivo de Teste (.csv ou .zip)", key="teste_uploader", type=['csv', 'zip'])
+    
+    if arquivo_teste is not None:
+        df_teste_raw = load_data_zip(arquivo_teste)
+        if df_teste_raw is None:
             st.stop()
 
-        st.write(df.head())
+        if st.button("🔍 Executar Previsão e Avaliação"):
+            try:
+                # Cria features de lag nos dados de teste
+                df_teste_lagged = create_lag_features(df_teste_raw.reset_index(drop=True), N_LAG)
+                
+                # --- Preparação dos Dados de Teste ---
+                
+                # Verificação se tem rótulo (para fins de avaliação)
+                tem_rotulo = TARGET_COLUMN in df_teste_lagged.columns
+                
+                if tem_rotulo:
+                    X_test = df_teste_lagged.drop(columns=[TARGET_COLUMN])
+                    y_real = df_teste_lagged[TARGET_COLUMN]
+                else:
+                    # Se não tem rótulo, usa as features de lag criadas, menos a coluna time
+                    # que terá NaNs e não será usada, pois não existe na base original
+                    X_test = df_teste_lagged.drop(columns=[TARGET_COLUMN], errors='ignore')
+                
+                # Normalizar usando o scaler TREINADO
+                X_test_scaled = st.session_state['scaler'].transform(X_test)
+                
+                # Prever
+                previsoes = st.session_state['modelo'].predict(X_test_scaled)
+                
+                # Criar DataFrame de resultados
+                # Adicionamos as colunas de lag para contexto, mas focamos na previsão
+                df_resultado = df_teste_lagged.copy()
+                df_resultado['Previsao'] = previsoes
+                
+                # --- AVALIAÇÃO E DOWNLOAD ---
+                st.subheader("Resultados da Previsão")
 
-        if "time" not in df.columns:
-            st.error("CSV precisa conter coluna 'time'.")
-        elif st.button("Treinar Modelo"):
-            rmse, r2, model, scaler = train_model_timeseries(df)
-            st.success("Treinado com sucesso!")
-            st.metric("RMSE (val)", f"{rmse:.4f}")
-            st.metric("R² (val)", f"{r2:.4f}")
+                if tem_rotulo:
+                    # Comparação de desempenho real e esperado
+                    mse_real = mean_squared_error(y_real, previsoes)
+                    st.metric(label="Desempenho Real (MSE)", value=f"{mse_real:.4f}")
+                    st.line_chart(df_resultado[[TARGET_COLUMN, 'Previsao']].tail(100))
+                    st.success("Previsão e avaliação de desempenho concluídas.")
+                else:
+                    # Caso de teste sem rótulos (apenas disponibilizar dados)
+                    st.info("Arquivo sem rótulos. Apenas previsões geradas.")
 
+                # Download do CSV (compactado em ZIP)
+                compress_and_download(df_resultado, filename='resultados_previsao.zip')
+            
+            except Exception as e:
+                st.error(f"Erro ao executar a previsão: Verifique se o arquivo de teste contém as colunas necessárias e se o número de lags ({N_LAG}) não gerou um erro de dimensão. Detalhes: {e}")
 
-elif page == "Testar Modelo":
-    st.header("📤 Upload do CSV de Teste")
-
-    uploaded_file = st.file_uploader("Envie o CSV", type=["csv"])
-    if uploaded_file is not None:
-        raw_bytes = uploaded_file.read()
-        compressed = compress_bytes(raw_bytes)
-
-        save_path = os.path.join(UPLOADS_DIR, f"test_{uploaded_file.name}.bin")
-        with open(save_path, "wb") as f:
-            f.write(compressed)
-
-        st.markdown(make_download_link_bytes(compressed, f"test_{uploaded_file.name}.bin"), unsafe_allow_html=True)
-
-        try:
-            csv_bytes = decompress_bytes(compressed)
-            df = pd.read_csv(io.BytesIO(csv_bytes), sep=",")
-
-            # correção de BOM / caracteres invisíveis
-            df.columns = df.columns.str.strip().str.replace('\ufeff', '', regex=False)
-
-            # tentar renomear automaticamente caso a coluna esteja com lixo
-            for c in df.columns:
-                if c.replace("\ufeff", "").strip().lower() == "time":
-                    df = df.rename(columns={c: "time"})
-                    break
-
-        except Exception as e:
-            st.error(f"Erro: {e}")
-            st.stop()
-
-        st.write(df.head())
-
-        if st.button("Executar Teste"):
-            if model is None:
-                st.error("Treine primeiro.")
-            else:
-                result, rmse, r2 = apply_model(df, model, scaler)
-                st.dataframe(result.head())
-
-                out = io.BytesIO()
-                result.to_csv(out, index=False)
-                compressed_out = compress_bytes(out.getvalue())
-                st.markdown(make_download_link_bytes(compressed_out, "predicoes.bin"), unsafe_allow_html=True)
-
-                if rmse is not None:
-                    st.metric("RMSE real", f"{rmse:.4f}")
-                    st.metric("R² real", f"{r2:.4f}")
-
-
-elif page == "Resetar Modelo":
-    if st.button("Resetar Tudo"):
-        reset_persistent_model()
-        st.success("Reset concluído.")
-
-
-elif page == "Status":
-    st.write("Modelo:", os.path.exists(MODEL_PATH))
-    st.write("Scaler:", os.path.exists(SCALER_PATH))
-    st.write("Uploads:", os.listdir(UPLOADS_DIR))
+else:
+    st.warning("Aguardando o upload do arquivo de treino e o treinamento do modelo (Bloco 1).")
