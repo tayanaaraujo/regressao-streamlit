@@ -2,194 +2,290 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, make_scorer
-from sklearn.model_selection import cross_val_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
 from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
 import io
-import zipfile # Para a compactação/descompactação (Requisito de Segurança)
+import zipfile
+import pickle
+import heapq
+from collections import Counter
 
-# --- Configuração Inicial ---
+# ------------------------------------------------------------------
+# Configurações Gerais
+# ------------------------------------------------------------------
 st.set_page_config(page_title="Projeto Regressão Linear na Nuvem", layout="wide")
-st.title("🎓 Treinamento de Modelo na Nuvem - Azure")
-TARGET_COLUMN = 'time' # Coluna alvo da série temporal
-N_LAG = 5 # Número de observações anteriores (conforme seu enunciado)
+st.title("🎓 Treinamento de Modelo em Nuvem (Azure) — Regressão Linear")
 
-# --- Variáveis de Estado (Memória do App) ---
+TARGET_COLUMN = 'time'
+N_LAG = 5
+
+# ------------------------------------------------------------------
+# Controle do estado do app
+# ------------------------------------------------------------------
 if 'modelo' not in st.session_state:
     st.session_state['modelo'] = None
 if 'scaler' not in st.session_state:
     st.session_state['scaler'] = None
+if 'train_df' not in st.session_state:
+    st.session_state['train_df'] = None
+if 'compressed_train' not in st.session_state:
+    st.session_state['compressed_train'] = None
 
-# --- Funções de Tratamento de Dados ---
 
-@st.cache_data
-def create_lag_features(df, n_lag):
-    """Cria features de lag para dados de série temporal (t-1, t-2, ...)."""
-    df_lag = df.copy()
+# ------------------------------------------------------------------
+# Criação de Lags (para séries temporais)
+# ------------------------------------------------------------------
+def create_lag_features(df: pd.DataFrame, n_lag: int):
+    if TARGET_COLUMN not in df.columns:
+        raise ValueError(f"Coluna alvo '{TARGET_COLUMN}' não encontrada.")
+
+    df_l = df.copy()
     for i in range(1, n_lag + 1):
-        df_lag[f't-{i}'] = df_lag[TARGET_COLUMN].shift(i)
-    # Remove as linhas com NaN resultantes do shift (os N_LAG primeiros)
-    df_lag.dropna(inplace=True)
-    return df_lag
+        df_l[f't-{i}'] = df_l[TARGET_COLUMN].shift(i)
 
-@st.cache_data
-def load_data_zip(uploaded_file, file_type='csv'):
-    """Descompacta o arquivo ZIP e lê o CSV (Atende ao requisito Ponto-a-ponta)."""
-    if uploaded_file.name.endswith('.zip'):
-        with zipfile.ZipFile(uploaded_file, 'r') as zf:
-            # Assumimos que há um único CSV dentro do ZIP
-            csv_filename = [f for f in zf.namelist() if f.endswith('.csv')][0]
-            with zf.open(csv_filename) as csv_file:
-                return pd.read_csv(csv_file)
-    elif uploaded_file.name.endswith('.csv'):
-        # Se for CSV direto, apenas lê
-        return pd.read_csv(uploaded_file)
+    df_l.dropna(inplace=True)
+
+    cols = [f't-{i}' for i in range(n_lag, 0, -1)] + [TARGET_COLUMN]
+    return df_l[cols]
+
+
+# ------------------------------------------------------------------
+# Compactação Huffman
+# ------------------------------------------------------------------
+class HuffmanNode:
+    def __init__(self, freq, byte=None, left=None, right=None):
+        self.freq = freq
+        self.byte = byte
+        self.left = left
+        self.right = right
+    def __lt__(self, other):
+        return self.freq < other.freq
+
+
+def build_huffman_tree(data_bytes: bytes):
+    freq = Counter(data_bytes)
+    heap = [HuffmanNode(f, b) for b, f in freq.items()]
+    heapq.heapify(heap)
+
+    if len(heap) == 1:
+        node = heapq.heappop(heap)
+        root = HuffmanNode(node.freq, None, node, None)
+        heapq.heappush(heap, root)
+
+    while len(heap) > 1:
+        n1 = heapq.heappop(heap)
+        n2 = heapq.heappop(heap)
+        merged = HuffmanNode(n1.freq + n2.freq, None, n1, n2)
+        heapq.heappush(heap, merged)
+
+    return heap[0]
+
+
+def generate_huffman_codes(root):
+    codes = {}
+    def _gen(node, prefix):
+        if node.byte is not None:
+            codes[node.byte] = prefix or '0'
+            return
+        _gen(node.left, prefix + '0')
+        _gen(node.right, prefix + '1')
+    _gen(root, '')
+    return codes
+
+
+def huffman_compress(data_bytes: bytes):
+    root = build_huffman_tree(data_bytes)
+    codes = generate_huffman_codes(root)
+    bitstr = ''.join(codes[b] for b in data_bytes)
+
+    pad_len = (8 - len(bitstr) % 8) % 8
+    if pad_len:
+        bitstr += '0' * pad_len
+
+    b_arr = bytearray()
+    for i in range(0, len(bitstr), 8):
+        b_arr.append(int(bitstr[i:i+8], 2))
+
+    payload = bytes(b_arr)
+    return pickle.dumps({'codes': codes, 'pad_len': pad_len, 'payload': payload})
+
+
+def huffman_decompress(pickled_bytes: bytes):
+    store = pickle.loads(pickled_bytes)
+    codes = store['codes']
+    pad_len = store['pad_len']
+    payload = store['payload']
+
+    inv = {v: k for k, v in codes.items()}
+    bitstr = ''.join(f'{b:08b}' for b in payload)
+
+    if pad_len:
+        bitstr = bitstr[:-pad_len]
+
+    out = bytearray()
+    cur = ''
+    for bit in bitstr:
+        cur += bit
+        if cur in inv:
+            out.append(inv[cur])
+            cur = ''
+    return bytes(out)
+
+
+# ------------------------------------------------------------------
+# Função de leitura CSV/ZIP
+# ------------------------------------------------------------------
+def load_data(uploaded):
+    if uploaded.name.endswith('.zip'):
+        with zipfile.ZipFile(uploaded, 'r') as zf:
+            csvs = [f for f in zf.namelist() if f.endswith('.csv')]
+            if len(csvs) != 1:
+                st.error("O ZIP deve conter exatamente 1 arquivo CSV.")
+                return None
+            with zf.open(csvs[0]) as f:
+                return pd.read_csv(f)
     else:
-        st.error(f"Formato de arquivo não suportado. Use .csv ou .zip contendo um .csv.")
-        return None
-
-def compress_and_download(df, filename="resultados_previsao.zip"):
-    """Compacta o CSV de resultados em ZIP para download (Requisito de Segurança)."""
-    csv_buffer = io.StringIO()
-    df.to_csv(csv_buffer, index=False)
-    csv_data = csv_buffer.getvalue()
-    
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'a', zipfile.ZIP_DEFLATED, False) as zf:
-        # Cria um arquivo CSV dentro do ZIP
-        zf.writestr('previsao.csv', csv_data)
-        
-    st.download_button(
-        label="📥 Baixar Resultados (ZIP Compactado)",
-        data=zip_buffer.getvalue(),
-        file_name=filename,
-        mime='application/zip',
-    )
+        return pd.read_csv(uploaded)
 
 
-# --- Barra Lateral para Reset ---
+def download_huffman(df, filename):
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    compressed = huffman_compress(buf.getvalue().encode('utf-8'))
+    st.download_button("📥 Baixar Arquivo Compactado (Huffman)", compressed, filename)
+
+
+# ------------------------------------------------------------------
+# Sidebar
+# ------------------------------------------------------------------
 with st.sidebar:
-    st.header("Controles")
+    st.header("⚙️ Controles")
     if st.button("🔄 Resetar Modelo"):
-        st.session_state['modelo'] = None
-        st.session_state['scaler'] = None
-        st.info("Modelo e Normalizador resetados. Clique em Run again.")
-        st.experimental_rerun()
-    
-    st.info(f"Modelo: Regressão Linear\nLags de Série Temporal: {N_LAG}")
+        st.session_state.clear()
+        st.rerun()
 
-# -------------------------------------------------------------
-# BLOCO 1: TREINAMENTO (Com Normalização e Validação Cruzada)
-# -------------------------------------------------------------
-st.header("1. Treinamento do Modelo")
-arquivo_treino = st.file_uploader("Faça upload do arquivo de Treino (.csv ou .zip)", type=['csv', 'zip'])
 
-if arquivo_treino is not None:
-    df_raw = load_data_zip(arquivo_treino)
-    if df_raw is None:
-        st.stop()
-        
-    df_treino = create_lag_features(df_raw.reset_index(drop=True), N_LAG)
-    
-    if df_treino is not None:
-        st.subheader("Amostra de Dados Processados")
-        st.dataframe(df_treino.head())
-        
-        if st.button("🚀 Treinar Modelo com Validação Cruzada"):
-            try:
-                # Separação de features e rótulos
-                X_train_clean = df_treino.drop(columns=[TARGET_COLUMN])
-                y_train = df_treino[TARGET_COLUMN]
-                
-                # Normalização Min-Max (Requisito do projeto)
-                scaler = MinMaxScaler()
-                X_train_scaled = scaler.fit_transform(X_train_clean)
-                
-                # Treino do modelo final (fit em todos os dados)
-                model = LinearRegression()
-                model.fit(X_train_scaled, y_train)
-                
-                # Validação Cruzada (Para obter EXPECTATIVA de desempenho)
-                # Usamos o MSE (Mean Squared Error) como métrica
-                mse_scorer = make_scorer(mean_squared_error, greater_is_better=False)
-                scores = cross_val_score(model, X_train_scaled, y_train, 
-                                         cv=5, # 5 Folds
-                                         scoring=mse_scorer)
-                
-                # O cross_val_score retorna valores negativos para o MSE, então pegamos a média.
-                mean_mse = -scores.mean()
-                
-                # Salvar na memória (session_state)
-                st.session_state['modelo'] = model
-                st.session_state['scaler'] = scaler
-                
-                st.success("Modelo treinado, scaler ajustado e Validação Cruzada concluída!")
-                st.subheader("Desempenho Esperado (Validação Cruzada)")
-                st.metric(label="Média do Erro Quadrático Médio (MSE)", value=f"{mean_mse:.4f}")
-                
-            except Exception as e:
-                st.error(f"Erro ao treinar: Verifique se a coluna '{TARGET_COLUMN}' existe no seu CSV. Detalhes: {e}")
+# ------------------------------------------------------------------
+# 1. Treinamento
+# ------------------------------------------------------------------
+st.header("1️⃣ Treinamento do Modelo")
 
-# -------------------------------------------------------------
-# BLOCO 2: TESTE E APLICAÇÃO (Com Verificação de Rótulos)
-# -------------------------------------------------------------
-st.header("2. Teste / Aplicação do Modelo")
+uploaded_train = st.file_uploader("Upload do arquivo de treino (.csv ou .zip)", type=['csv', 'zip'])
 
-if st.session_state['modelo'] is not None:
-    arquivo_teste = st.file_uploader("Faça upload do arquivo de Teste (.csv ou .zip)", key="teste_uploader", type=['csv', 'zip'])
-    
-    if arquivo_teste is not None:
-        df_teste_raw = load_data_zip(arquivo_teste)
-        if df_teste_raw is None:
-            st.stop()
+if uploaded_train:
+    raw = uploaded_train.getvalue()
+    compressed = huffman_compress(raw)
+    st.session_state['compressed_train'] = compressed
 
-        if st.button("🔍 Executar Previsão e Avaliação"):
-            try:
-                # Cria features de lag nos dados de teste
-                df_teste_lagged = create_lag_features(df_teste_raw.reset_index(drop=True), N_LAG)
-                
-                # --- Preparação dos Dados de Teste ---
-                
-                # Verificação se tem rótulo (para fins de avaliação)
-                tem_rotulo = TARGET_COLUMN in df_teste_lagged.columns
-                
-                if tem_rotulo:
-                    X_test = df_teste_lagged.drop(columns=[TARGET_COLUMN])
-                    y_real = df_teste_lagged[TARGET_COLUMN]
-                else:
-                    # Se não tem rótulo, usa as features de lag criadas, menos a coluna time
-                    # que terá NaNs e não será usada, pois não existe na base original
-                    X_test = df_teste_lagged.drop(columns=[TARGET_COLUMN], errors='ignore')
-                
-                # Normalizar usando o scaler TREINADO
-                X_test_scaled = st.session_state['scaler'].transform(X_test)
-                
-                # Prever
-                previsoes = st.session_state['modelo'].predict(X_test_scaled)
-                
-                # Criar DataFrame de resultados
-                # Adicionamos as colunas de lag para contexto, mas focamos na previsão
-                df_resultado = df_teste_lagged.copy()
-                df_resultado['Previsao'] = previsoes
-                
-                # --- AVALIAÇÃO E DOWNLOAD ---
-                st.subheader("Resultados da Previsão")
+    df_raw = pd.read_csv(io.BytesIO(huffman_decompress(compressed)))
 
-                if tem_rotulo:
-                    # Comparação de desempenho real e esperado
-                    mse_real = mean_squared_error(y_real, previsoes)
-                    st.metric(label="Desempenho Real (MSE)", value=f"{mse_real:.4f}")
-                    st.line_chart(df_resultado[[TARGET_COLUMN, 'Previsao']].tail(100))
-                    st.success("Previsão e avaliação de desempenho concluídas.")
-                else:
-                    # Caso de teste sem rótulos (apenas disponibilizar dados)
-                    st.info("Arquivo sem rótulos. Apenas previsões geradas.")
+    df_train = create_lag_features(df_raw, N_LAG)
+    st.subheader("Amostra dos Dados de Treino")
+    st.dataframe(df_train.head())
 
-                # Download do CSV (compactado em ZIP)
-                compress_and_download(df_resultado, filename='resultados_previsao.zip')
-            
-            except Exception as e:
-                st.error(f"Erro ao executar a previsão: Verifique se o arquivo de teste contém as colunas necessárias e se o número de lags ({N_LAG}) não gerou um erro de dimensão. Detalhes: {e}")
+    if st.button("🚀 Treinar Modelo"):
+        X = df_train.drop(columns=[TARGET_COLUMN])
+        y = df_train[TARGET_COLUMN]
+
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        tscv = TimeSeriesSplit(n_splits=5)
+
+        model = LinearRegression()
+        model.fit(X_scaled, y)
+
+        # validação cruzada real para séries
+        preds_cv = cross_val_predict(model, X_scaled, y, cv=tscv)
+
+        mse_cv = mean_squared_error(y, preds_cv)
+        mae_cv = mean_absolute_error(y, preds_cv)
+        r2_cv = r2_score(y, preds_cv)
+
+        st.session_state['modelo'] = model
+        st.session_state['scaler'] = scaler
+        st.session_state['train_df'] = df_train
+
+        st.success("Modelo treinado com sucesso!")
+
+        # métricas
+        st.subheader("📊 Desempenho Esperado (Validação Cruzada)")
+        st.write(f"**MSE:** {mse_cv:.4f}")
+        st.write(f"**MAE:** {mae_cv:.4f}")
+        st.write(f"**R²:** {r2_cv:.4f}")
+
+        # gráfico treino CV
+        st.subheader("📈 Real x Predito (Validação Cruzada)")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(y.values, label='Real')
+        ax.plot(preds_cv, label='Predito (CV)')
+        ax.legend()
+        ax.set_title("Validação Cruzada — Real x Predito")
+        st.pyplot(fig)
+
+
+# ------------------------------------------------------------------
+# 2. Teste / Aplicação
+# ------------------------------------------------------------------
+st.header("2️⃣ Teste / Aplicação")
+
+if st.session_state['modelo']:
+    uploaded_test = st.file_uploader("Upload do teste (.csv ou .zip)", type=['csv', 'zip'])
+
+    if uploaded_test:
+        raw_test = uploaded_test.getvalue()
+        compressed_test = huffman_compress(raw_test)
+
+        df_test = pd.read_csv(io.BytesIO(huffman_decompress(compressed_test)))
+        df_test_lag = create_lag_features(df_test, N_LAG)
+
+        st.subheader("Amostra dos Dados de Teste")
+        st.dataframe(df_test_lag.head())
+
+        if st.button("🔍 Executar Previsão"):
+            tem_rotulo = TARGET_COLUMN in df_test_lag.columns
+
+            X_test = df_test_lag.drop(columns=[TARGET_COLUMN], errors='ignore')
+            y_real = df_test_lag[TARGET_COLUMN] if tem_rotulo else None
+
+            X_test_scaled = st.session_state['scaler'].transform(X_test)
+            preds = st.session_state['modelo'].predict(X_test_scaled)
+
+            df_result = df_test_lag.copy()
+            df_result["Previsao"] = preds
+
+            st.subheader("📈 Resultados")
+
+            if tem_rotulo:
+                mse = mean_squared_error(y_real, preds)
+                mae = mean_absolute_error(y_real, preds)
+                r2 = r2_score(y_real, preds)
+
+                st.write(f"**MSE (real):** {mse:.4f}")
+                st.write(f"**MAE (real):** {mae:.4f}")
+                st.write(f"**R² (real):** {r2:.4f}")
+
+                # gráfico: real vs previsto
+                fig2, ax2 = plt.subplots(figsize=(10, 4))
+                ax2.plot(y_real.values, label='Real')
+                ax2.plot(preds, label='Predito')
+                ax2.legend()
+                ax2.set_title("Teste — Real x Predito")
+                st.pyplot(fig2)
+
+                # erro absoluto
+                abs_error = abs(y_real - preds)
+                fig3, ax3 = plt.subplots(figsize=(10, 4))
+                ax3.bar(range(len(abs_error)), abs_error)
+                ax3.set_title("Erro Absoluto por Ponto")
+                st.pyplot(fig3)
+
+            else:
+                st.info("Arquivo sem rótulos — apenas previsões geradas.")
+
+            download_huffman(df_result, "previsoes_huffman.bin")
 
 else:
-    st.warning("Aguardando o upload do arquivo de treino e o treinamento do modelo (Bloco 1).")
+    st.warning("⚠️ Treine o modelo antes de fazer o teste.")
