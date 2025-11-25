@@ -277,7 +277,7 @@ else:
         st.subheader("Amostra dos Dados de Teste Processados")
         st.dataframe(df_test.head())
 
-        if st.button("🔍 Executar Previsão (Teste)"):
+        if st.button("Executar Previsão (Teste)"):
             X_test = df_test.drop(columns=[TARGET_COLUMN], errors='ignore')
             y_test = df_test[TARGET_COLUMN] if TARGET_COLUMN in df_test.columns else None
 
@@ -319,11 +319,10 @@ else:
                 st.info("Arquivo de teste sem rótulos — apenas previsões geradas.")
 
             # download compactado Huffman
-           # download_huffman(df_result, "previsoes_huffman.bin")
+                download_huffman(df_result, "previsoes_huffman.bin")
 
 # ------------------------------------------------------------------
 # Opção de download do treino (compactado)
 # ------------------------------------------------------------------
 if st.session_state.get('compressed_train') is not None:
     st.sidebar.download_button('Baixar treino (Huffman compactado)', data=st.session_state['compressed_train'], file_name='treino_huffman.bin', mime='application/octet-stream')
-    st.sidebar.download_button('Baixar teste (Huffman compactado)', data=st.session_state['df_result'], file_name='previsoes_huffman.bin', mime='application/octet-stream')
