@@ -319,7 +319,7 @@ else:
                 st.info("Arquivo de teste sem rótulos — apenas previsões geradas.")
 
             # download compactado Huffman
-                download_huffman(df_result, "previsoes_huffman.bin")
+            download_huffman(df_result, "previsoes_huffman.bin")
 
 # ------------------------------------------------------------------
 # Opção de download do treino (compactado)
