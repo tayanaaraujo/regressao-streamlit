@@ -1,193 +1,98 @@
-📘 Descrição Explicada do Código
+# Regressão Linear em Série Temporal – Treino e Teste Remoto com Streamlit
 
-Este projeto implementa uma aplicação Streamlit para treinar e testar um modelo de Regressão Linear aplicado a séries temporais, incluindo criação de lags, validação cruzada temporal, compactação com Huffman, e geração de gráficos.
+Este projeto implementa um sistema completo para **treinamento, avaliação e execução remota** de um modelo de **Regressão Linear** aplicado a uma **série temporal**.
 
-Abaixo está a explicação de cada parte do código.
-🔧 1. Configurações Iniciais
+A aplicação foi desenvolvida em **Python + Streamlit** e permite o envio de arquivos, tratamento automático dos dados, treinamento, teste e download das previsões.
 
-Importa as bibliotecas necessárias:
+---
 
-streamlit para interface web.
+## Funcionalidades Principais
 
-pandas, numpy para manipulação de dados.
+### Upload de arquivo `.csv` para **treino do modelo**
+- Aceita arquivos contendo as variáveis `t-1` a `t-5` e o rótulo `time`.
+- O modelo é treinado automaticamente após o upload.
 
-sklearn para modelagem (linear regression, métricas, escalonamento, time series split).
+---
 
-matplotlib para gráficos.
+### Treinamento remoto com Regressão Linear
+Após o envio do arquivo de treino, o sistema realiza:
 
-pickle, zipfile, io para manipulação de arquivos.
+- Normalização **Min–Max**
+- Criação de lags da série temporal (5 passos anteriores)
+- Separação entre features e rótulos
+- Treinamento do modelo `LinearRegression`
+- Exibição da **expectativa de desempenho** com:
 
-heapq, Counter para a implementação da codificação de Huffman.
+  - MSE  
+  - MAE  
+  - R²  
 
-Configura layout da página via st.set_page_config.
+---
 
-Define variáveis globais:
+### Upload de arquivo `.csv` para **teste do modelo**
 
-TARGET_COLUMN = "time"
+O sistema lida com dois cenários:
 
-Número de defasagens N_LAG = 5
+#### **A) Teste COM rótulo (`time`)**
+- Gera previsões
+- Avalia o desempenho real
+- Exibe métricas (MSE, MAE, R²)
+- Mostra gráficos:
+  - Real vs Predito
+  - Erro Absoluto
+- Disponibiliza o arquivo de previsões compactado para download (`.bin`)
 
-Número de splits da validação cruzada temporal N_SPLITS = 5
+#### **B) Teste SEM rótulo**
+- Apenas gera as previsões
+- Não calcula métricas
+- Disponibiliza o arquivo compactado para download
 
-Inicializa variáveis no session_state (modelo, scaler e dados).
+---
 
-🧩 2. Função de Criação de Lags
+### Tratamento de Dados Ponta a Ponta
+O sistema executa automaticamente:
 
-A função create_lag_features recebe um DataFrame com a coluna time e cria:
+- Normalização Min–Max  
+- Geração de lags  
+- Padronização dos dados  
+- Compressão das previsões via **Huffman coding**  
+- Reconstrução da base de teste caso faltem features  
 
-t-5, t-4, t-3, t-2, t-1, time
+---
 
+### Reset do modelo
+Um botão “**Resetar Modelo**” permite:
 
-Ou seja, para prever o valor atual, utiliza os 5 valores anteriores.
-Ela também remove linhas com NaN decorrentes do deslocamento.
+- Limpar os dados da sessão
+- Treinar o modelo novamente com outra base
 
-🗜️ 3. Implementação do Algoritmo de Huffman
+---
 
-O código implementa compactação e descompactação usando:
+## Sobre a Base de Dados
 
-Classe HuffmanNode
+A base representa uma **série temporal** onde o valor atual depende dos **cinco valores anteriores**.  
+O objetivo é prever a coluna:
 
-Construção da árvore de Huffman conforme frequência dos bytes
+- `time`
 
-Geração dos códigos binários de cada byte
+As features utilizadas são:
+t-1, t-2, t-3, t-4, t-5
 
-Compactação de qualquer arquivo em bytes
+## Fluxo Completo da Aplicação
 
-Descompactação reversa
+1. Upload do arquivo de treino  
+2. Tratamento da base  
+3. Treinamento do modelo  
+4. Exibição da expectativa de desempenho  
+5. Upload do arquivo de teste  
+6. Previsão  
+7. Avaliação (se houver rótulo)  
+8. Download do arquivo compactado  
+9. Reset do modelo (opcional)  
 
-Essa compactação é usada:
+---
 
-Para armazenar o upload do CSV com redução de tamanho
+## Download das Previsões
 
-Para baixar as previsões de forma compactada
-
-É um recurso avançado que torna o projeto diferenciado.
-
-📦 4. Funções de I/O
-
-load_data()
-Lê CSVs diretamente ou dentro de ZIP.
-
-download_huffman()
-Gera um botão para baixar um DataFrame em formato compactado via Huffman.
-
-🧰 5. Barra Lateral
-
-Na sidebar existe:
-
-Botão para resetar toda a sessão, apagando modelo, scaler e dados.
-
-🏋️‍♂️ 6. Seção 1 — Treinamento do Modelo
-
-📌 Upload obrigatório de arquivo .csv ou .zip.
-
-Passos ao fazer upload:
-
-O arquivo é compactado com Huffman e salvo.
-
-Em seguida, é descompactado para leitura:
-
-Mantém coerência ponta-a-ponta da compactação.
-
-O dataframe é processado para criar os lags.
-
-O usuário visualiza parte da amostra.
-
-▶️ Quando o usuário clica em Treinar Modelo:
-
-Separam-se X e y.
-
-Aplica-se normalização (MinMaxScaler).
-
-Executa-se TimeSeriesSplit com 5 folds.
-
-Em cada fold:
-
-Treina um modelo em X_train
-
-Prediz em X_test
-
-Armazena previsões na ordem temporal correta
-
-Calcula as métricas de validação cruzada:
-
-MSE
-
-MAE
-
-R²
-
-Treina-se o modelo final com todos os dados.
-
-Salva:
-
-modelo treinado
-
-scaler
-
-dados de treino
-
-Gera gráfico:
-
-Linha real completa
-
-Previsões separadas por cada fold, com cores diferentes
-
-🔍 7. Seção 2 — Teste / Aplicação
-
-Disponível somente após o modelo ser treinado.
-
-O usuário pode enviar outro arquivo, contendo ou não valores reais.
-
-Processo:
-
-O arquivo é compactado com Huffman (padrão do projeto).
-
-É descompactado e lido como CSV.
-
-São criados os lags.
-
-O usuário visualiza a amostra.
-
-Ao clicar em Executar Previsão:
-
-Aplica o scaler do treino.
-
-Usa o modelo salvo para prever.
-
-Cria um DataFrame com os resultados.
-
-Se existirem valores reais:
-
-Calcula MSE, MAE, R²
-
-Gera:
-
-Gráfico Real vs Predito
-
-Gráfico dos erros absolutos por ponto
-
-Permite baixar o arquivo compactado com Huffman.
-
-📥 8. Download do Treino Compactado
-
-Na barra lateral, o usuário pode baixar o CSV de treino compactado via Huffman, exatamente como foi armazenado.
-
-
-🎯 Resumo do Fluxo Completo
-
-Upload → Compacta com Huffman → Descompacta → Lê → Cria lags
-
-Treina modelo com validação temporal
-
-Exibe métricas e gráficos por fold
-
-Salva modelo e scaler
-
-Teste com ou sem valores reais
-
-Exibe métricas de teste + gráficos
-
-Permite baixar resultados compactados
-
-Permite baixar dataset de treino compactado
+Após o teste, o sistema disponibiliza:
+previsoes_huffman.bin
