@@ -16,7 +16,7 @@ from collections import Counter
 # Configurações Gerais
 # ------------------------------------------------------------------
 st.set_page_config(page_title="Projeto Regressão Linear na Nuvem", layout="wide")
-st.title("🎓 Treinamento de Modelo em Nuvem (Azure) — Regressão Linear")
+st.title("Treinamento de Modelo em Nuvem (Azure): Regressão Linear")
 
 TARGET_COLUMN = 'time'
 N_LAG = 5
@@ -146,15 +146,15 @@ def download_huffman(df, filename):
 # Sidebar controles
 # ------------------------------------------------------------------
 with st.sidebar:
-    st.header("⚙️ Controles")
-    if st.button("🔄 Resetar Modelo"):
+    st.header("Controles")
+    if st.button("Resetar Modelo"):
         st.session_state.clear()
         st.rerun()
 
 # ------------------------------------------------------------------
 # 1) TREINAMENTO
 # ------------------------------------------------------------------
-st.header("1️⃣ Treinamento do Modelo (upload obrigatório)")
+st.header("Treinamento do Modelo")
 
 uploaded_train = st.file_uploader("Upload do arquivo de treino (.csv ou .zip)", type=['csv', 'zip'], key='up_train')
 
@@ -180,7 +180,7 @@ if uploaded_train is not None:
     st.subheader("Amostra dos Dados de Treino")
     st.dataframe(df_train.head())
 
-    if st.button("🚀 Treinar Modelo (TimeSeriesSplit CV)"):
+    if st.button("Treinar Modelo (TimeSeriesSplit CV)"):
         X = df_train.drop(columns=[TARGET_COLUMN])
         y = df_train[TARGET_COLUMN].values  # array 1D
 
@@ -217,10 +217,10 @@ if uploaded_train is not None:
         st.session_state['scaler'] = scaler
         st.session_state['train_df'] = df_train
 
-        st.success("✅ Modelo treinado e salvo na sessão.")
+        st.success("Modelo treinado e salvo na sessão.")
 
         # Mostrar métricas esperadas (CV)
-        st.subheader("📊 Desempenho Esperado (Validação Cruzada — Temporal)")
+        st.subheader("Desempenho Esperado (Validação Cruzada — Temporal)")
         st.write(f"**MSE (esperado):** {mse_cv:.4f}")
         st.write(f"**MAE (esperado):** {mae_cv:.4f}")
         st.write(f"**R² (esperado):** {r2_cv:.4f}")
@@ -228,7 +228,7 @@ if uploaded_train is not None:
         # -------------------------
         # Gráfico 3 — combinado por folds (Real + Predições por fold)
         # -------------------------
-        st.subheader("📈 Real x Predito (Validação Cruzada por folds)")
+        st.subheader("Real x Predito (Validação Cruzada por folds)")
 
         fig, ax = plt.subplots(figsize=(12, 4))
         # linha real inteira
@@ -251,7 +251,7 @@ if uploaded_train is not None:
 # ------------------------------------------------------------------
 # 2) TESTE / APLICAÇÃO
 # ------------------------------------------------------------------
-st.header("2️⃣ Teste / Aplicação (Upload opcional)")
+st.header("Teste do modelo")
 
 if st.session_state.get('modelo') is None:
     st.warning("Treine o modelo antes de usar a etapa de teste.")
@@ -290,7 +290,7 @@ else:
             df_result = df_test.copy()
             df_result['Previsao'] = preds_test
 
-            st.subheader("📈 Resultados (Teste)")
+            st.subheader("Resultados (Teste)")
             if y_test is not None:
                 mse_test = mean_squared_error(y_test, preds_test)
                 mae_test = mean_absolute_error(y_test, preds_test)
@@ -319,10 +319,11 @@ else:
                 st.info("Arquivo de teste sem rótulos — apenas previsões geradas.")
 
             # download compactado Huffman
-            download_huffman(df_result, "previsoes_huffman.bin")
+           # download_huffman(df_result, "previsoes_huffman.bin")
 
 # ------------------------------------------------------------------
 # Opção de download do treino (compactado)
 # ------------------------------------------------------------------
 if st.session_state.get('compressed_train') is not None:
-    st.sidebar.download_button('📦 Baixar treino (Huffman compactado)', data=st.session_state['compressed_train'], file_name='treino_huffman.bin', mime='application/octet-stream')
+    st.sidebar.download_button('Baixar treino (Huffman compactado)', data=st.session_state['compressed_train'], file_name='treino_huffman.bin', mime='application/octet-stream')
+    st.sidebar.download_button('Baixar teste (Huffman compactado)', data=st.session_state['df_result'], file_name='previsoes_huffman.bin', mime='application/octet-stream')
